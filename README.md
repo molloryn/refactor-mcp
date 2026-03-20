@@ -16,14 +16,30 @@ Build and run the Docker image as a stdio MCP server:
 
 ```bash
 docker build -t refactor-mcp:local .
-docker run --rm -i -v /mnt/d:/mnt/d refactor-mcp:local
+docker run --rm -i \
+  -v /mnt/d:/mnt/d \
+  -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
+  refactor-mcp:local
+```
+
+If your projects use private feeds or a custom `NuGet.Config`, also mount the host NuGet config directory:
+
+```bash
+docker run --rm -i \
+  -v /mnt/d:/mnt/d \
+  -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
+  -v /mnt/c/Users/<user>/AppData/Roaming/NuGet:/root/.nuget/NuGet:ro \
+  refactor-mcp:local
 ```
 
 Run a simple JSON-mode smoke test inside the container:
 
 ```bash
 docker run --rm -i refactor-mcp:local --json Version '{}'
-docker run --rm -i -v /mnt/d:/mnt/d refactor-mcp:local --json LoadSolution '{"solutionPath":"/mnt/d/Code/refactor-mcp/RefactorMCP.slnx"}'
+docker run --rm -i \
+  -v /mnt/d:/mnt/d \
+  -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
+  refactor-mcp:local --json LoadSolution '{"solutionPath":"/mnt/d/Code/refactor-mcp/RefactorMCP.slnx"}'
 ```
 
 Register the container with Codex as a local stdio MCP server:
@@ -32,6 +48,7 @@ Register the container with Codex as a local stdio MCP server:
 codex mcp add refactor-mcp -- \
   docker run --rm -i \
   -v /mnt/d:/mnt/d \
+  -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
   refactor-mcp:local
 ```
 
