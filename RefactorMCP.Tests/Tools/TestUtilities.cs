@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 
@@ -49,6 +50,77 @@ public static class TestUtilities
         }
 
         return Path.Combine(root, ExampleCodeRelativePaths[0]);
+    }
+
+    public static string GetTestAssetPath(params string[] relativeSegments)
+    {
+        var root = Path.GetDirectoryName(GetSolutionPath())!;
+        var path = Path.Combine(root, "RefactorMCP.Tests", "TestAssets");
+        foreach (var segment in relativeSegments)
+        {
+            path = Path.Combine(path, segment);
+        }
+
+        return path;
+    }
+
+    public static async Task<string> PrepareIsolatedFixtureAsync(string fixtureRelativePath, string destinationRoot)
+    {
+        var fixtureSource = GetTestAssetPath(fixtureRelativePath);
+        var fixtureName = Path.GetFileName(fixtureSource.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        var fixtureDestination = Path.Combine(destinationRoot, fixtureName);
+
+        CopyDirectory(fixtureSource, fixtureDestination);
+
+        var solutionPath = Directory.GetFiles(fixtureDestination, "*.slnx", SearchOption.TopDirectoryOnly)[0];
+        await RunDotNetBuildAsync(solutionPath);
+        return solutionPath;
+    }
+
+    private static void CopyDirectory(string sourceDirectory, string destinationDirectory)
+    {
+        Directory.CreateDirectory(destinationDirectory);
+
+        foreach (var directory in Directory.GetDirectories(sourceDirectory, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(sourceDirectory, directory);
+            Directory.CreateDirectory(Path.Combine(destinationDirectory, relativePath));
+        }
+
+        foreach (var file in Directory.GetFiles(sourceDirectory, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(sourceDirectory, file);
+            var targetPath = Path.Combine(destinationDirectory, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+            File.Copy(file, targetPath, overwrite: true);
+        }
+    }
+
+    private static async Task RunDotNetBuildAsync(string solutionPath)
+    {
+        var startInfo = new ProcessStartInfo("dotnet")
+        {
+            WorkingDirectory = Path.GetDirectoryName(solutionPath)!,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false
+        };
+        startInfo.ArgumentList.Add("build");
+        startInfo.ArgumentList.Add("-nodeReuse:false");
+        startInfo.ArgumentList.Add(solutionPath);
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Failed to start dotnet build");
+
+        var standardOutput = await process.StandardOutput.ReadToEndAsync();
+        var standardError = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"dotnet build failed for '{solutionPath}'.{Environment.NewLine}{standardOutput}{Environment.NewLine}{standardError}");
+        }
     }
 
     public static string GetSampleCodeForExtractMethod() => """

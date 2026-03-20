@@ -27,6 +27,8 @@
   <ItemGroup>
     <Compile Remove="TestOutput\**\*.cs" />
     <None Include="TestOutput\**\*.cs" />
+    <Compile Remove="TestAssets\**\*.cs" />
+    <None Include="TestAssets\**\*.cs" />
   </ItemGroup>
 
 </Project>

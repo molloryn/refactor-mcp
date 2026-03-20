@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading;
 
 namespace RefactorMCP.Tests;
 
@@ -22,6 +23,31 @@ public abstract class TestBase : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(TestOutputPath))
-            Directory.Delete(TestOutputPath, true);
+        {
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                try
+                {
+                    Directory.Delete(TestOutputPath, true);
+                    break;
+                }
+                catch (IOException) when (attempt < 4)
+                {
+                    Thread.Sleep(200);
+                }
+                catch (UnauthorizedAccessException) when (attempt < 4)
+                {
+                    Thread.Sleep(200);
+                }
+                catch (IOException)
+                {
+                    break;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    break;
+                }
+            }
+        }
     }
 }

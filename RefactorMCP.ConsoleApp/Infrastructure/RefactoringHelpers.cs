@@ -13,6 +13,7 @@ using Microsoft.CodeAnalysis.Text;
 using System.Text;
 using Microsoft.CodeAnalysis.Host.Mef;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 
 
@@ -27,6 +28,7 @@ internal static class RefactoringHelpers
     internal static MemoryCache SolutionCache = new(new MemoryCacheOptions());
     internal static MemoryCache SyntaxTreeCache = new(new MemoryCacheOptions());
     internal static MemoryCache ModelCache = new(new MemoryCacheOptions());
+    internal static MemoryCache RazorSolutionContextCache = new(new MemoryCacheOptions());
 
     internal static void ClearAllCaches()
     {
@@ -36,6 +38,8 @@ internal static class RefactoringHelpers
         SyntaxTreeCache = new MemoryCache(new MemoryCacheOptions());
         ModelCache.Dispose();
         ModelCache = new MemoryCache(new MemoryCacheOptions());
+        RazorSolutionContextCache.Dispose();
+        RazorSolutionContextCache = new MemoryCache(new MemoryCacheOptions());
     }
 
     private static readonly Lazy<AdhocWorkspace> _workspace =
@@ -162,6 +166,7 @@ internal static class RefactoringHelpers
         if (!string.IsNullOrEmpty(solutionPath))
         {
             SolutionCache.Set(solutionPath!, updatedDocument.Project.Solution);
+            RazorSolutionContextCache.Remove(solutionPath!);
             if (!string.IsNullOrEmpty(updatedDocument.FilePath))
             {
                 _ = MetricsProvider.RefreshFileMetrics(solutionPath!, updatedDocument.FilePath!);
@@ -169,13 +174,61 @@ internal static class RefactoringHelpers
         }
     }
 
+    internal static async Task<RazorSolutionContext> GetOrLoadRazorSolutionContext(
+        string solutionPath,
+        CancellationToken cancellationToken = default)
+    {
+        solutionPath = ResolveSolutionPath(solutionPath);
+        if (RazorSolutionContextCache.TryGetValue(solutionPath, out RazorSolutionContext? cachedContext))
+            return cachedContext!;
+
+        var solution = await GetOrLoadSolution(solutionPath, cancellationToken);
+        var context = await RazorSolutionContext.CreateAsync(solution, cancellationToken);
+        RazorSolutionContextCache.Set(solutionPath, context);
+        return context;
+    }
+
+    internal static void InvalidateSolutionCaches(string solutionPath)
+    {
+        solutionPath = ResolveSolutionPath(solutionPath);
+        SolutionCache.Remove(solutionPath);
+        RazorSolutionContextCache.Remove(solutionPath);
+    }
+
     internal static Document? GetDocumentByPath(Solution solution, string filePath)
     {
-        var normalizedPath = Path.GetFullPath(filePath);
+        var normalizedPath = NormalizePathForComparison(filePath);
         return solution.Projects
             .SelectMany(p => p.Documents)
-            .FirstOrDefault(d => Path.GetFullPath(d.FilePath ?? "") == normalizedPath);
+            .FirstOrDefault(d => PathEquals(d.FilePath, normalizedPath));
     }
+
+    internal static string NormalizePathForComparison(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        var normalized = path.Trim().Replace('\\', '/');
+        var wslMatch = Regex.Match(normalized, "^/mnt/([a-zA-Z])/(.+)$");
+        if (wslMatch.Success)
+        {
+            normalized = $"{char.ToLowerInvariant(wslMatch.Groups[1].Value[0])}:/{wslMatch.Groups[2].Value}";
+        }
+        else
+        {
+            var windowsMatch = Regex.Match(normalized, "^([a-zA-Z]):/(.+)$");
+            if (windowsMatch.Success)
+                normalized = $"{char.ToLowerInvariant(windowsMatch.Groups[1].Value[0])}:/{windowsMatch.Groups[2].Value}";
+        }
+
+        return normalized.TrimEnd('/').ToLowerInvariant();
+    }
+
+    internal static bool PathEquals(string? left, string? right) =>
+        string.Equals(
+            NormalizePathForComparison(left),
+            NormalizePathForComparison(right),
+            StringComparison.OrdinalIgnoreCase);
 
     internal static bool TryParseRange(string range, out int startLine, out int startColumn, out int endLine, out int endColumn)
     {
@@ -434,7 +487,10 @@ internal static class RefactoringHelpers
 
         var updatedText = PreserveLineEndings(text, originalText);
         await File.WriteAllTextAsync(filePath, updatedText, encoding, cancellationToken);
-        UpdateFileCaches(filePath, updatedText);
+        if (string.Equals(Path.GetExtension(filePath), ".cs", StringComparison.OrdinalIgnoreCase))
+        {
+            UpdateFileCaches(filePath, updatedText);
+        }
     }
 
     internal static string PreserveLineEndings(string updatedText, string originalText)

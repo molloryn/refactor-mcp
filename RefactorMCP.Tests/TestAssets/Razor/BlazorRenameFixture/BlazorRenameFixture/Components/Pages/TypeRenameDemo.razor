@@ -1,0 +1,11 @@
+@page "/type-rename-demo"
+
+<h1>Type Rename Demo</h1>
+<p>@Widget.FinalLabel</p>
+
+@code {
+    private ProbeWidget Widget = new()
+    {
+        FinalLabel = "probe"
+    };
+}

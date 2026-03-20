@@ -8,6 +8,9 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Threading;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Text;
 
 [McpServerToolType]
 public static class RenameSymbolTool
@@ -24,29 +27,78 @@ public static class RenameSymbolTool
     {
         try
         {
+            solutionPath = RefactoringHelpers.ResolveSolutionPath(solutionPath);
             var solution = await RefactoringHelpers.GetOrLoadSolution(solutionPath, cancellationToken);
-            var document = RefactoringHelpers.GetDocumentByPath(solution, filePath);
-            if (document == null)
-                throw new McpException($"Error: File {filePath} not found in solution");
+            var razorContext = await RefactoringHelpers.GetOrLoadRazorSolutionContext(solutionPath, cancellationToken);
+            var fileKind = RazorDocumentClassifier.Classify(filePath);
 
-            var symbol = await FindSymbol(document, oldName, line, column, cancellationToken);
+            if (fileKind is RazorDocumentKind.RazorImports or RazorDocumentKind.RazorViewImports)
+                throw new McpException($"Error: RenameSymbol does not support starting from '{Path.GetFileName(filePath)}' in Phase 1");
+
+            ISymbol? symbol;
+            if (RazorDocumentClassifier.IsSupportedRenameEntryPoint(fileKind))
+            {
+                var razorResolution = await razorContext.FindSymbolAsync(
+                    solution,
+                    filePath,
+                    oldName,
+                    line,
+                    column,
+                    cancellationToken);
+
+                if (razorResolution.Symbol == null &&
+                    line.HasValue &&
+                    column.HasValue &&
+                    !razorResolution.HasMappedCSharpTokenAtPosition)
+                {
+                    throw new McpException(
+                        "Error: RenameSymbol does not support the selected Razor span in Phase 1. Select a C#-backed identifier.");
+                }
+
+                symbol = razorResolution.Symbol;
+            }
+            else
+            {
+                var document = RefactoringHelpers.GetDocumentByPath(solution, filePath);
+                if (document == null)
+                    throw new McpException($"Error: File {filePath} not found in solution");
+
+                symbol = await FindSymbol(document, oldName, line, column, cancellationToken);
+            }
+
             if (symbol == null)
                 throw new McpException($"Error: Symbol '{oldName}' not found");
 
             var options = new SymbolRenameOptions();
+            var razorProjectedChanges = razorContext.HasRazorDocuments
+                ? await RazorSourceMappingService.CreateChangeSetAsync(
+                    symbol,
+                    solution,
+                    oldName,
+                    newName,
+                    cancellationToken)
+                : new RazorProjectedChangeSet(
+                    ImmutableDictionary<string, ImmutableArray<RazorProjectedEdit>>.Empty);
+
             var renamed = await Renamer.RenameSymbolAsync(solution, symbol, options, newName, cancellationToken);
-            var changes = renamed.GetChanges(solution);
-            foreach (var projectChange in changes.GetProjectChanges())
+            var changedDocuments = await CollectChangedDocumentsAsync(solution, renamed, cancellationToken);
+
+            foreach (var changedDocument in changedDocuments)
             {
-                foreach (var id in projectChange.GetChangedDocuments())
-                {
-                    var newDoc = renamed.GetDocument(id)!;
-                    var text = await newDoc.GetTextAsync(cancellationToken);
-                    var (originalText, encoding) = await RefactoringHelpers.ReadFileWithEncodingAsync(newDoc.FilePath!, cancellationToken);
-                    var updatedText = PreserveLineEndings(text.ToString(), originalText);
-                    await RefactoringHelpers.WriteFileWithEncodingAsync(newDoc.FilePath!, updatedText, encoding, cancellationToken);
-                    RefactoringHelpers.UpdateSolutionCache(newDoc);
-                }
+                await RefactoringHelpers.WriteFileWithEncodingAsync(
+                    changedDocument.FilePath,
+                    changedDocument.UpdatedText,
+                    changedDocument.Encoding,
+                    cancellationToken);
+
+                if (!razorProjectedChanges.HasEdits)
+                    RefactoringHelpers.UpdateSolutionCache(changedDocument.Document);
+            }
+
+            if (razorProjectedChanges.HasEdits)
+            {
+                await RazorSourceMappingService.ApplyProjectedChangesAsync(razorProjectedChanges, cancellationToken);
+                RefactoringHelpers.InvalidateSolutionCaches(solutionPath);
             }
 
             return $"Successfully renamed '{oldName}' to '{newName}'";
@@ -57,7 +109,7 @@ public static class RenameSymbolTool
         }
     }
 
-    private static async Task<ISymbol?> FindSymbol(Document document, string name, int? line, int? column, CancellationToken cancellationToken)
+    internal static async Task<ISymbol?> FindSymbol(Document document, string name, int? line, int? column, CancellationToken cancellationToken)
     {
         var model = await document.GetSemanticModelAsync(cancellationToken);
         var root = await document.GetSyntaxRootAsync(cancellationToken);
@@ -87,7 +139,7 @@ public static class RenameSymbolTool
         return decls.FirstOrDefault();
     }
 
-    private static ISymbol? GetSymbolFromNode(SemanticModel model, SyntaxNode? node)
+    internal static ISymbol? GetSymbolFromNode(SemanticModel model, SyntaxNode? node)
     {
         while (node != null)
         {
@@ -101,12 +153,29 @@ public static class RenameSymbolTool
         return null;
     }
 
-    private static string PreserveLineEndings(string updatedText, string originalText)
+    private static async Task<IReadOnlyList<ChangedDocumentWriteback>> CollectChangedDocumentsAsync(
+        Solution originalSolution,
+        Solution renamedSolution,
+        CancellationToken cancellationToken)
     {
-        var normalizedUpdatedText = updatedText.Replace("\r\n", "\n");
-        if (originalText.Contains("\r\n"))
-            return normalizedUpdatedText.Replace("\n", "\r\n");
+        var writebacks = new List<ChangedDocumentWriteback>();
+        var changes = renamedSolution.GetChanges(originalSolution);
+        foreach (var projectChange in changes.GetProjectChanges())
+        {
+            foreach (var id in projectChange.GetChangedDocuments())
+            {
+                var newDoc = renamedSolution.GetDocument(id);
+                if (newDoc?.FilePath == null)
+                    continue;
 
-        return normalizedUpdatedText;
+                var text = await newDoc.GetTextAsync(cancellationToken);
+                var (_, encoding) = await RefactoringHelpers.ReadFileWithEncodingAsync(newDoc.FilePath, cancellationToken);
+                writebacks.Add(new ChangedDocumentWriteback(newDoc, newDoc.FilePath, text.ToString(), encoding));
+            }
+        }
+
+        return writebacks;
     }
+
+    private sealed record ChangedDocumentWriteback(Document Document, string FilePath, string UpdatedText, Encoding Encoding);
 }
