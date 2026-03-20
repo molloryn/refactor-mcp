@@ -1,6 +1,7 @@
 using System.IO;
 using System.Threading;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using ModelContextProtocol;
 using Xunit;
@@ -389,6 +390,37 @@ public class Sample
         Assert.Contains("Successfully renamed", result);
         var fileContent = await File.ReadAllTextAsync(testFile);
         Assert.Contains("internalValue", fileContent);
+    }
+
+    [Fact]
+    public async Task RenameSymbol_Utf8WithoutBom_DoesNotAddBom()
+    {
+        const string initialCode = """
+public class Sample
+{
+    private int value;
+    public int Read() => value;
+}
+""";
+
+        var testFile = Path.Combine(TestOutputPath, "RenameNoBom.cs");
+        await File.WriteAllTextAsync(testFile, initialCode, new UTF8Encoding(false));
+
+        await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var solution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+        var project = solution.Projects.First();
+        RefactoringHelpers.AddDocumentToProject(project, testFile);
+
+        var result = await RenameSymbolTool.RenameSymbol(
+            SolutionPath,
+            testFile,
+            "value",
+            "currentValue");
+
+        Assert.Contains("Successfully renamed", result);
+
+        var bytes = await File.ReadAllBytesAsync(testFile);
+        Assert.False(bytes.Take(3).SequenceEqual(new byte[] { 0xEF, 0xBB, 0xBF }));
     }
 
     [Fact]
