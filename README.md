@@ -6,10 +6,32 @@ The repo targets `.NET 10`, uses [`RefactorMCP.slnx`](./RefactorMCP.slnx) as its
 
 ## Usage
 
-Run the console application directly or host it as an MCP server:
+By default the server starts in a token-lean basic mode that exposes only the most common refactoring tools plus solution/session utilities:
+
+- `rename-symbol`
+- `find-usages`
+- `move-to-separate-file`
+- `load-solution`
+- `begin-load-solution`
+- `get-load-solution-status`
+- `cancel-load-solution`
+- `unload-solution`
+- `clear-solution-cache`
+- `version`
+- `list-tools`
+
+This repo also includes an installable Codex skill at [`.codex/skills/refactor-mcp-core`](./.codex/skills/refactor-mcp-core). Users can copy that folder into their own Codex skills directory to get the default `refactor-mcp` workflow guidance outside the MCP server itself.
+
+Start the console application directly or host it as an MCP server:
 
 ```bash
 dotnet run --project RefactorMCP.ConsoleApp
+```
+
+Start the full server surface with `--advanced` when you need the less common refactorings, resources, and analysis prompts:
+
+```bash
+dotnet run --project RefactorMCP.ConsoleApp -- --advanced
 ```
 
 Build and run the Docker image as a stdio MCP server:
@@ -20,6 +42,15 @@ docker run --rm -i \
   -v /mnt/d:/mnt/d \
   -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
   refactor-mcp:local
+```
+
+Run the full advanced surface in Docker:
+
+```bash
+docker run --rm -i \
+  -v /mnt/d:/mnt/d \
+  -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
+  refactor-mcp:local --advanced
 ```
 
 If your projects use private feeds or a custom `NuGet.Config`, also mount the host NuGet config directory:
@@ -74,6 +105,16 @@ codex mcp add refactor-mcp -- \
   refactor-mcp:local
 ```
 
+Register the advanced profile separately if you want the full tool surface available:
+
+```bash
+codex mcp add refactor-mcp-advanced -- \
+  docker run --rm -i \
+  -v /mnt/d:/mnt/d \
+  -v /mnt/c/Users/<user>/.nuget/packages:/root/.nuget/packages \
+  refactor-mcp:local --advanced
+```
+
 Build or test the repo from the root:
 
 ```bash
@@ -85,7 +126,16 @@ For usage examples see [EXAMPLES.md](./EXAMPLES.md).
 
 ## Available Refactorings
 
+Default mode:
+
 - **Rename Symbol** – rename a symbol across the solution using Roslyn. Phase 1 includes source-mapped Razor rename support for `RenameSymbol` across `.cs`, `.razor`, `.razor.cs`, `.cshtml`, and `.cshtml.cs` when the edit can be mapped safely back to the original Razor source. When a top-level type rename comes from a single-type `.cs` file whose filename matches the original type name, the file is renamed to match the new type name as well. `_Imports.razor` and `_ViewImports.cshtml` are explicit unsupported entry points, and unsupported Razor spans fail safely instead of applying partial edits.
+- **Find Usages** – resolve a symbol from a C# source file and return declaration/reference locations across the solution with configurable result limits.
+- **Move Type to Separate File** – move a top-level type into its own file named after the type.
+- **Begin Load Solution / Get Load Solution Status / Cancel Load Solution** – start a background solution load, poll structured progress snapshots, and cancel an in-flight load from the same long-lived MCP server session when a client cannot block on a single long-running MCP call.
+- **Load / Unload / Clear Solution Cache / Version / List Tools** – utility commands for session control and discoverability.
+
+Advanced mode (`--advanced`) enables the rest of the refactoring surface:
+
 - **Extract Method** – create a new method from selected code and replace the original with a call (expression-bodied methods are not supported).
 - **Introduce Field/Parameter/Variable** – turn expressions into new members; fails if a field already exists.
 - **Convert to Static** – make instance methods static using parameters or an instance argument.
@@ -105,9 +155,8 @@ For usage examples see [EXAMPLES.md](./EXAMPLES.md).
 - **Create Adapter** – generate an adapter class wrapping an existing method.
 - **Add Observer** – introduce an event and raise it from a method.
 - **Use Interface** – change a method parameter type to one of its implemented interfaces.
-- **List Tools** – display all available refactoring tools as kebab-case names.
 
-Metrics and summaries are also available via the `metrics://` and `summary://` resource schemes.
+Advanced mode also enables the existing analysis prompts and the `metrics://` / `summary://` resources.
 
 ## Contributing
 

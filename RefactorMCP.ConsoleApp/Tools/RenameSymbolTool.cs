@@ -65,7 +65,7 @@ public static class RenameSymbolTool
                 if (document == null)
                     throw new McpException($"Error: File {filePath} not found in solution");
 
-                symbol = await FindSymbol(document, oldName, line, column, cancellationToken);
+                symbol = await SymbolResolution.FindSymbolAsync(document, oldName, line, column, cancellationToken);
             }
 
             if (symbol == null)
@@ -124,50 +124,6 @@ public static class RenameSymbolTool
         {
             throw new McpException($"Error renaming symbol: {ex.Message}", ex);
         }
-    }
-
-    internal static async Task<ISymbol?> FindSymbol(Document document, string name, int? line, int? column, CancellationToken cancellationToken)
-    {
-        var model = await document.GetSemanticModelAsync(cancellationToken);
-        var root = await document.GetSyntaxRootAsync(cancellationToken);
-        if (model == null || root == null)
-            return null;
-
-        if (line.HasValue && column.HasValue)
-        {
-            var text = await document.GetTextAsync(cancellationToken);
-            if (line.Value > 0 && line.Value <= text.Lines.Count && column.Value > 0)
-            {
-                var pos = text.Lines[line.Value - 1].Start + column.Value - 1;
-                var symbolAtPosition = GetSymbolFromNode(model, root.FindToken(pos).Parent);
-                if (symbolAtPosition != null && symbolAtPosition.Name == name)
-                    return symbolAtPosition;
-            }
-        }
-
-        foreach (var token in root.DescendantTokens().Where(t => t.ValueText == name || t.Text == name))
-        {
-            var symbolInDocument = GetSymbolFromNode(model, token.Parent);
-            if (symbolInDocument != null && symbolInDocument.Name == name)
-                return symbolInDocument;
-        }
-
-        var decls = await SymbolFinder.FindDeclarationsAsync(document.Project, name, false, cancellationToken);
-        return decls.FirstOrDefault();
-    }
-
-    internal static ISymbol? GetSymbolFromNode(SemanticModel model, SyntaxNode? node)
-    {
-        while (node != null)
-        {
-            var symbol = model.GetDeclaredSymbol(node) ?? model.GetSymbolInfo(node).Symbol;
-            if (symbol != null)
-                return symbol;
-
-            node = node.Parent;
-        }
-
-        return null;
     }
 
     private static async Task<IReadOnlyList<ChangedDocumentWriteback>> CollectChangedDocumentsAsync(

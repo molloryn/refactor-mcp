@@ -433,4 +433,6 @@ runtimes/
 BuildHost-net472/
 BuildHost-netcore/ 
 TestOutput/codeMetricsCache.json
+RefactorMCP.Tests/TestOutput/
 .refactor-mcp/
+tool-call-log.jsonl

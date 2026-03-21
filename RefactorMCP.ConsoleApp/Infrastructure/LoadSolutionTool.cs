@@ -31,9 +31,10 @@ public static class LoadSolutionTool
 
             if (RefactoringHelpers.TryGetReusableLoadedSolution(solutionPath, out var cached))
             {
-                return BuildLoadedMessage(solutionPath, cached!);
+                return RefactoringHelpers.BuildLoadedSolutionMessage(solutionPath, cached!);
             }
 
+            SolutionLoadManager.CancelAllLoads();
             RefactoringHelpers.ClearAllCaches();
             MoveMethodTool.ResetMoveHistory();
 
@@ -43,7 +44,7 @@ public static class LoadSolutionTool
             var metricsDir = Path.Combine(Path.GetDirectoryName(solutionPath)!, ".refactor-mcp", "metrics");
             Directory.CreateDirectory(metricsDir);
 
-            var message = BuildLoadedMessage(solutionPath, solution);
+            var message = RefactoringHelpers.BuildLoadedSolutionMessage(solutionPath, solution);
             progress?.Report($"{message} in {stopwatch.Elapsed:mm\\:ss\\.fff}");
             return message;
         }
@@ -51,11 +52,5 @@ public static class LoadSolutionTool
         {
             throw new McpException($"Error loading solution: {ex.Message}", ex);
         }
-    }
-
-    private static string BuildLoadedMessage(string solutionPath, Solution solution)
-    {
-        var projects = solution.Projects.Select(p => p.Name).ToList();
-        return $"Successfully loaded solution '{Path.GetFileName(solutionPath)}' with {projects.Count} projects: {string.Join(", ", projects)}";
     }
 }

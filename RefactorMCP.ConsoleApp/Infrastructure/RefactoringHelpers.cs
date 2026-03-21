@@ -153,6 +153,40 @@ internal static class RefactoringHelpers
         }
     }
 
+    internal static async Task<Solution> LoadSolutionIntoSessionWithProjectProgress(
+        string solutionPath,
+        IProgress<ProjectLoadProgress>? progress,
+        CancellationToken cancellationToken = default)
+    {
+        solutionPath = ResolveSolutionPath(solutionPath);
+        var loadLock = _solutionLoadLocks.GetOrAdd(solutionPath, _ => new SemaphoreSlim(1, 1));
+        await loadLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (TryGetLoadedSolution(solutionPath, out var cachedSolution))
+            {
+                return cachedSolution!;
+            }
+
+            var workspace = CreateWorkspace();
+            try
+            {
+                var solution = await workspace.OpenSolutionAsync(solutionPath, progress, cancellationToken);
+                CacheLoadedSolution(solutionPath, workspace, solution);
+                return solution;
+            }
+            catch
+            {
+                workspace.Dispose();
+                throw;
+            }
+        }
+        finally
+        {
+            loadLock.Release();
+        }
+    }
+
     internal static bool TryResolveSolutionPath(string solutionPath, out string resolvedSolutionPath)
     {
         resolvedSolutionPath = string.Empty;
@@ -450,6 +484,8 @@ internal static class RefactoringHelpers
 
     internal static void AddDocumentToProject(Project project, string filePath)
     {
+        project = GetLatestProject(project);
+
         if (project.Documents.Any(d =>
                 Path.GetFullPath(d.FilePath ?? "") == Path.GetFullPath(filePath)))
             return;
@@ -462,6 +498,22 @@ internal static class RefactoringHelpers
         {
             SetLoadedSolution(solutionPath!, newDoc.Project.Solution);
         }
+    }
+
+    private static Project GetLatestProject(Project project)
+    {
+        var solutionPath = project.Solution.FilePath;
+        if (!string.IsNullOrEmpty(solutionPath) &&
+            TryGetLoadedSolution(solutionPath, out var latestSolution))
+        {
+            var latestProject = latestSolution!.GetProject(project.Id);
+            if (latestProject != null)
+            {
+                return latestProject;
+            }
+        }
+
+        return project;
     }
 
     private static CSharpCompilation CreateCompilation(SyntaxTree tree)
@@ -611,6 +663,12 @@ internal static class RefactoringHelpers
             return await withSolution(document);
 
         return await singleFile(filePath);
+    }
+
+    internal static string BuildLoadedSolutionMessage(string solutionPath, Solution solution)
+    {
+        var projects = solution.Projects.Select(p => p.Name).ToList();
+        return $"Successfully loaded solution '{Path.GetFileName(solutionPath)}' with {projects.Count} projects: {string.Join(", ", projects)}";
     }
 
     private static void CacheLoadedSolution(

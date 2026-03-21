@@ -1,46 +1,54 @@
-﻿using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.MSBuild;
-using Microsoft.CodeAnalysis.Formatting;
-using Microsoft.CodeAnalysis.Text;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
-using System;
-using System.ComponentModel;
-using System.Reflection;
-using System.Text;
-using System.Text.Json;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 [assembly: InternalsVisibleTo("RefactorMCP.Tests")]
 
-// Parse command line arguments
-if (args.Length > 0 && args[0] == "--json")
+var commandLine = McpCommandLineOptions.Parse(args);
+McpServerFeatureCatalog.Configure(commandLine.Mode);
+
+if (commandLine.IsJsonMode)
 {
-    await RunJsonMode(args);
+    await RunJsonMode(commandLine.RemainingArgs, commandLine.Mode);
     return;
 }
 
-var builder = Host.CreateApplicationBuilder(args);
+var builder = Host.CreateApplicationBuilder(commandLine.RemainingArgs);
 builder.Logging.AddConsole(consoleLogOptions =>
 {
-    // Configure all logs to go to stderr
+    // Configure all logs to go to stderr.
     consoleLogOptions.LogToStandardErrorThreshold = LogLevel.Trace;
 });
 
-builder.Services
+var mcpBuilder = builder.Services
     .AddMcpServer()
-    .WithStdioServerTransport()
-    .WithToolsFromAssembly()
-    .WithResourcesFromAssembly()
-    .WithPromptsFromAssembly();
+    .WithStdioServerTransport();
+
+RegisterServerFeatures(mcpBuilder, commandLine.Mode);
 
 await builder.Build().RunAsync();
 
-static async Task RunJsonMode(string[] args)
+static void RegisterServerFeatures(IMcpServerBuilder builder, McpFeatureMode mode)
+{
+    builder.WithTools(McpServerFeatureCatalog.GetToolTypes(mode));
+
+    var promptTypes = McpServerFeatureCatalog.GetPromptTypes(mode);
+    if (promptTypes.Count > 0)
+    {
+        builder.WithPrompts(promptTypes);
+    }
+
+    var resourceTypes = McpServerFeatureCatalog.GetResourceTypes(mode);
+    if (resourceTypes.Count > 0)
+    {
+        builder.WithResources(resourceTypes);
+    }
+}
+
+static async Task RunJsonMode(string[] args, McpFeatureMode mode)
 {
     if (args.Length < 3)
     {
@@ -71,45 +79,37 @@ static async Task RunJsonMode(string[] args)
         return;
     }
 
-    var method = System.Reflection.Assembly.GetExecutingAssembly()
-        .GetTypes()
-        .Where(t => t.GetCustomAttributes(typeof(McpServerToolTypeAttribute), false).Length > 0)
-        .SelectMany(t => t.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
-        .FirstOrDefault(m => m.GetCustomAttributes(typeof(McpServerToolAttribute), false).Length > 0 &&
-                             m.Name.Equals(toolName, StringComparison.OrdinalIgnoreCase));
-
+    var method = McpServerFeatureCatalog.FindToolMethod(toolName, mode);
     if (method == null)
     {
-        Console.WriteLine($"Unknown tool: {toolName}. Use the ListTools tool to see available commands.");
+        var message = McpServerFeatureCatalog.IsKnownTool(toolName)
+            ? McpServerFeatureCatalog.BuildDisabledToolMessage(toolName)
+            : $"Unknown tool: {toolName}. Use the ListTools tool to see available commands.";
+        Console.WriteLine(message);
         return;
     }
 
     var parameters = method.GetParameters();
     var invokeArgs = new object?[parameters.Length];
     var rawValues = new Dictionary<string, string?>();
-    for (int i = 0; i < parameters.Length; i++)
+    for (var index = 0; index < parameters.Length; index++)
     {
-        var p = parameters[i];
-        if (paramDict.TryGetValue(p.Name!, out var value))
+        var parameter = parameters[index];
+        if (paramDict.TryGetValue(parameter.Name!, out var value))
         {
-            rawValues[p.Name!] = value.ToString();
-            if (value.ValueKind == JsonValueKind.String)
-            {
-                invokeArgs[i] = ConvertInput(value.GetString()!, p.ParameterType);
-            }
-            else
-            {
-                invokeArgs[i] = value.Deserialize(p.ParameterType, new JsonSerializerOptions());
-            }
+            rawValues[parameter.Name!] = value.ToString();
+            invokeArgs[index] = value.ValueKind == JsonValueKind.String
+                ? ConvertInput(value.GetString()!, parameter.ParameterType)
+                : value.Deserialize(parameter.ParameterType, new JsonSerializerOptions());
         }
-        else if (p.HasDefaultValue)
+        else if (parameter.HasDefaultValue)
         {
-            rawValues[p.Name!] = null;
-            invokeArgs[i] = p.DefaultValue;
+            rawValues[parameter.Name!] = null;
+            invokeArgs[index] = parameter.DefaultValue;
         }
         else
         {
-            Console.WriteLine($"Error: Missing required parameter '{p.Name}'");
+            Console.WriteLine($"Error: Missing required parameter '{parameter.Name}'");
             return;
         }
     }
@@ -117,18 +117,21 @@ static async Task RunJsonMode(string[] args)
     try
     {
         var result = method.Invoke(null, invokeArgs);
-        if (result is Task<string> taskStr)
-        {
-            Console.WriteLine(await taskStr);
-        }
-        else if (result is Task task)
+        if (result is Task task)
         {
             await task;
-            Console.WriteLine("Done");
+            if (task.GetType().IsGenericType)
+            {
+                WriteResult(task.GetType().GetProperty("Result")?.GetValue(task));
+            }
+            else
+            {
+                Console.WriteLine("Done");
+            }
         }
         else if (result != null)
         {
-            Console.WriteLine(result.ToString());
+            WriteResult(result);
         }
     }
     catch (Exception ex)
@@ -137,49 +140,54 @@ static async Task RunJsonMode(string[] args)
     }
     finally
     {
-        if (!string.Equals(method.Name, nameof(LoadSolutionTool.LoadSolution)))
+        if (!string.Equals(method.Name, nameof(LoadSolutionTool.LoadSolution), StringComparison.Ordinal))
+        {
             ToolCallLogger.Log(method.Name, rawValues);
+        }
     }
 }
 
-static string ListAvailableTools()
+static void WriteResult(object? result)
 {
-    var toolNames = System.Reflection.Assembly.GetExecutingAssembly()
-        .GetTypes()
-        .Where(t => t.GetCustomAttributes(typeof(McpServerToolTypeAttribute), false).Length > 0)
-        .SelectMany(t => t.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
-        .Where(m => m.GetCustomAttributes(typeof(McpServerToolAttribute), false).Length > 0)
-        .Select(m => ToKebabCase(m.Name))
-        .OrderBy(n => n)
-        .ToArray();
-
-    return "Available refactoring tools:\n" + string.Join("\n", toolNames);
-
-}
-
-
-static string ToKebabCase(string name)
-{
-    var sb = new StringBuilder();
-    for (int i = 0; i < name.Length; i++)
+    if (result is null)
     {
-        var c = name[i];
-        if (char.IsUpper(c) && i > 0)
-            sb.Append('-');
-        sb.Append(char.ToLowerInvariant(c));
+        return;
     }
-    return sb.ToString();
+
+    if (result is string text)
+    {
+        Console.WriteLine(text);
+        return;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(result, new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true
+    }));
 }
 
 static object? ConvertInput(string value, Type targetType)
 {
     if (targetType == typeof(string))
+    {
         return value;
+    }
+
     if (targetType == typeof(string[]))
+    {
         return value.Split(',', StringSplitOptions.RemoveEmptyEntries);
+    }
+
     if (targetType == typeof(int))
+    {
         return int.Parse(value);
+    }
+
     if (targetType == typeof(bool))
+    {
         return bool.Parse(value);
+    }
+
     return Convert.ChangeType(value, targetType);
 }

@@ -118,7 +118,7 @@ internal sealed class RazorSolutionContext
                     if (!RazorGeneratedDocumentText.ContainsSourcePosition(mappedSpan, line.Value, column.Value))
                         continue;
 
-                    var positionSymbol = RenameSymbolTool.GetSymbolFromNode(model, token.Parent);
+                    var positionSymbol = SymbolResolution.GetSymbolFromNode(model, token.Parent);
                     if (positionSymbol == null)
                         continue;
 
@@ -132,7 +132,7 @@ internal sealed class RazorSolutionContext
                 if (token.ValueText != oldName && token.Text != oldName)
                     continue;
 
-                var symbol = RenameSymbolTool.GetSymbolFromNode(model, token.Parent);
+                var symbol = SymbolResolution.GetSymbolFromNode(model, token.Parent);
                 if (symbol != null && symbol.Name == oldName)
                     return new RazorSymbolResolution(symbol, false);
             }

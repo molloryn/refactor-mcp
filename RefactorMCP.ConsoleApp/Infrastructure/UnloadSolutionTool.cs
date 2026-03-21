@@ -27,6 +27,7 @@ public static class UnloadSolutionTool
     public static string ClearSolutionCache(
         CancellationToken cancellationToken = default)
     {
+        SolutionLoadManager.CancelAllLoads();
         RefactoringHelpers.ClearAllCaches();
         return "Cleared all cached solutions";
     }

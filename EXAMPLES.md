@@ -4,6 +4,12 @@ This document provides comprehensive examples for all refactoring tools availabl
 
 Using the MCP tools is the preferred method for refactoring large C# files where manual edits become cumbersome.
 
+Default startup exposes only the core tools plus solution/session utilities. Start the server with `--advanced` when you need the rest of the examples in this document:
+
+```bash
+dotnet run --project RefactorMCP.ConsoleApp -- --advanced
+```
+
 ## Getting Started
 
 ### Loading a Solution
@@ -23,6 +29,9 @@ All examples use JSON parameters:
 ```bash
 dotnet run --project RefactorMCP.ConsoleApp -- --json ToolName '{"param":"value"}'
 ```
+
+### Installable Codex Skill
+The repo includes an installable Codex skill at `.codex/skills/refactor-mcp-core/`. Users can copy that folder into their own Codex skills directory if they want the default `refactor-mcp` workflow guidance outside the MCP server itself.
 
 ## 1. Extract Method
 
@@ -745,6 +754,67 @@ dotnet run --project RefactorMCP.ConsoleApp -- --cli load-solution "./RefactorMC
 Successfully loaded solution 'RefactorMCP.slnx' with 2 projects: RefactorMCP.ConsoleApp, RefactorMCP.Tests
 ```
 
+## 7. Begin Load Solution (Utility Command)
+
+**Purpose**: Start loading a solution in the background and return an operation id that can be polled from a client without waiting for the full design-time load to finish in a single MCP call.
+
+**Note**: Polling only works within the same long-lived MCP server process. The `--json` examples below show the payload shapes, but separate `dotnet run -- --json ...` invocations do not share in-memory operation state.
+
+### Example
+**Command**:
+```bash
+dotnet run --project RefactorMCP.ConsoleApp -- --json BeginLoadSolution '{"solutionPath":"./RefactorMCP.slnx"}'
+```
+
+**Expected Output**:
+```json
+{
+  "operationId": "8a4a0b8d8f254cbfb84424cbe3cced54",
+  "solutionPath": "/abs/path/RefactorMCP.slnx",
+  "state": "Queued",
+  "totalProjects": 2,
+  "completedProjects": 0,
+  "totalProjectFiles": 2,
+  "seenProjectFiles": 0,
+  "currentProjectOrdinal": 0,
+  "progressPercent": 0,
+  "message": "Queued",
+  "isTerminal": false
+}
+```
+
+## 8. Get Load Solution Status / Cancel Load Solution (Utility Command)
+
+**Purpose**: Poll structured progress updates for a background solution load and optionally cancel that load.
+
+### Example
+**Command**:
+```bash
+dotnet run --project RefactorMCP.ConsoleApp -- --json GetLoadSolutionStatus '{"operationId":"8a4a0b8d8f254cbfb84424cbe3cced54"}'
+```
+
+**Expected Output**:
+```json
+{
+  "operationId": "8a4a0b8d8f254cbfb84424cbe3cced54",
+  "state": "Loading",
+  "totalProjects": 2,
+  "completedProjects": 1,
+  "totalProjectFiles": 2,
+  "seenProjectFiles": 1,
+  "currentProjectOrdinal": 1,
+  "currentProjectName": "RefactorMCP.ConsoleApp",
+  "currentOperation": "Resolve",
+  "progressPercent": 50,
+  "isTerminal": false
+}
+```
+
+### Cancel Example
+```bash
+dotnet run --project RefactorMCP.ConsoleApp -- --json CancelLoadSolution '{"operationId":"8a4a0b8d8f254cbfb84424cbe3cced54"}'
+```
+
 ## 9. Unload Solution (Utility Command)
 
 **Purpose**: Remove a loaded solution from the in-memory cache.
@@ -799,7 +869,7 @@ Running the command again with the correct `sourceClass` succeeds.
 
 ## 11. List Tools (Utility Command)
 
-**Purpose**: Display all available refactoring tools and their status.
+**Purpose**: Display the currently enabled tool names for the active server profile.
 
 ### Example
 **Command**:
@@ -809,25 +879,20 @@ dotnet run --project RefactorMCP.ConsoleApp -- --json ListTools '{}'
 
 **Output**:
 ```
-Available refactoring tools:
-load-solution - Start a new session and load a solution file
-unload-solution - Remove a loaded solution from cache
-clear-solution-cache - Clear all cached solutions
-extract-method - Extract selected code into a new method
-introduce-field - Create a new field from selected code
-introduce-variable - Create a new variable from selected code
-make-field-readonly - Make a field readonly and move initialization to constructors
-introduce-parameter - Create a new parameter from selected code
-convert-to-static-with-parameters - Transform instance method to static
-convert-to-static-with-instance - Transform instance method to static with instance parameter
-move-static-method - Move a static method to another class
-move-instance-method - Move an instance method to another class
-move-multiple-methods-instance - Move several methods and keep them as instance methods
-move-multiple-methods-static - Move several methods and convert them to static with a `this` parameter
-transform-setter-to-init - Convert property setter to init-only setter
-safe-delete - Safely delete a field, parameter, or variable
-
+begin-load-solution
+cancel-load-solution
+clear-solution-cache
+find-usages
+get-load-solution-status
+list-tools-command
+load-solution
+move-to-separate-file
+rename-symbol
+unload-solution
+version
 ```
+
+Run the same command with `--advanced` to list the full tool surface.
 
 ## 12. Version Info (Utility Command)
 
@@ -961,6 +1026,50 @@ private List<int> values = new List<int>();
 // ...
 values.Add(result);
 return values.Sum() / (double)values.Count;
+```
+
+## Find Usages
+
+**Purpose**: Resolve a symbol from a C# file and return declaration/reference locations across the loaded solution.
+
+### Example
+**Command**:
+```bash
+dotnet run --project RefactorMCP.ConsoleApp -- --json FindUsages '{
+  "solutionPath":"./RefactorMCP.slnx",
+  "filePath":"./RefactorMCP.Tests/ExampleCode.cs",
+  "symbolName":"numbers",
+  "maxResults":10
+}'
+```
+
+**Expected Output**:
+```json
+{
+  "symbolName": "numbers",
+  "symbolKind": "Field",
+  "displayName": "List<int> Calculator.numbers",
+  "containingSymbol": "Calculator",
+  "totalReferenceCount": 3,
+  "returnedReferenceCount": 3,
+  "isTruncated": false,
+  "declarations": [
+    {
+      "filePath": "./RefactorMCP.Tests/ExampleCode.cs",
+      "line": 7,
+      "column": 23,
+      "lineText": "private List<int> numbers = new List<int>();"
+    }
+  ],
+  "references": [
+    {
+      "filePath": "./RefactorMCP.Tests/ExampleCode.cs",
+      "line": 18,
+      "column": 9,
+      "lineText": "numbers.Add(result);"
+    }
+  ]
+}
 ```
 
 ## 17. Feature Flag Refactor

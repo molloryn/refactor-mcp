@@ -124,12 +124,7 @@ internal static class ToolCallLogger
 
     private static MethodInfo? GetToolMethod(string toolName)
     {
-        return typeof(LoadSolutionTool).Assembly
-            .GetTypes()
-            .Where(t => t.GetCustomAttributes(typeof(McpServerToolTypeAttribute), false).Length > 0)
-            .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
-            .FirstOrDefault(m => m.GetCustomAttributes(typeof(McpServerToolAttribute), false).Length > 0 &&
-                                 m.Name.Equals(toolName, StringComparison.OrdinalIgnoreCase));
+        return McpServerFeatureCatalog.FindToolMethod(toolName, McpServerFeatureCatalog.CurrentMode);
     }
 
     private static object? ConvertInput(string value, Type targetType)
@@ -152,4 +147,3 @@ internal static class ToolCallLogger
         public DateTime Timestamp { get; set; }
     }
 }
-
