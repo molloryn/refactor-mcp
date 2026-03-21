@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Rename;
 using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Text;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
@@ -31,6 +32,7 @@ public static class RenameSymbolTool
         {
             solutionPath = RefactoringHelpers.ResolveSolutionPath(solutionPath);
             var solution = await RefactoringHelpers.GetOrLoadSolution(solutionPath, cancellationToken);
+            var symbolSolution = RefactoringHelpers.CreateAnalyzerSafeSolution(solution);
             var razorContext = await RefactoringHelpers.GetOrLoadRazorSolutionContext(solutionPath, cancellationToken);
             var fileKind = RazorDocumentClassifier.Classify(filePath);
 
@@ -41,7 +43,7 @@ public static class RenameSymbolTool
             if (RazorDocumentClassifier.IsSupportedRenameEntryPoint(fileKind))
             {
                 var razorResolution = await razorContext.FindSymbolAsync(
-                    solution,
+                    symbolSolution,
                     filePath,
                     oldName,
                     line,
@@ -61,7 +63,7 @@ public static class RenameSymbolTool
             }
             else
             {
-                var document = RefactoringHelpers.GetDocumentByPath(solution, filePath);
+                var document = RefactoringHelpers.GetDocumentByPath(symbolSolution, filePath);
                 if (document == null)
                     throw new McpException($"Error: File {filePath} not found in solution");
 
@@ -75,17 +77,17 @@ public static class RenameSymbolTool
             var razorProjectedChanges = razorContext.HasRazorDocuments
                 ? await RazorSourceMappingService.CreateChangeSetAsync(
                     symbol,
-                    solution,
+                    symbolSolution,
                     oldName,
                     newName,
                     cancellationToken)
                 : new RazorProjectedChangeSet(
                     ImmutableDictionary<string, ImmutableArray<RazorProjectedEdit>>.Empty);
 
-            var renamed = await Renamer.RenameSymbolAsync(solution, symbol, options, newName, cancellationToken);
-            var changedDocuments = await CollectChangedDocumentsAsync(solution, renamed, cancellationToken);
+            var renamed = await Renamer.RenameSymbolAsync(symbolSolution, symbol, options, newName, cancellationToken);
+            var changedDocuments = await CollectChangedDocumentsAsync(symbolSolution, renamed, cancellationToken);
             var fileRenamePlans = await CreateFileRenamePlansAsync(
-                solution,
+                symbolSolution,
                 symbol,
                 oldName,
                 newName,
@@ -101,9 +103,6 @@ public static class RenameSymbolTool
                     changedDocument.UpdatedText,
                     changedDocument.Encoding,
                     cancellationToken);
-
-                if (!requiresCacheInvalidation)
-                    RefactoringHelpers.UpdateSolutionCache(changedDocument.Document);
             }
 
             await ApplyFileRenamePlansAsync(fileRenamePlans, cancellationToken);
@@ -116,6 +115,13 @@ public static class RenameSymbolTool
             if (requiresCacheInvalidation)
             {
                 RefactoringHelpers.InvalidateSolutionCaches(solutionPath);
+            }
+            else
+            {
+                var updatedSessionSolution = MergeChangedDocumentsIntoSolution(solution, changedDocuments);
+                RefactoringHelpers.UpdateSolutionCache(
+                    updatedSessionSolution,
+                    changedDocuments.Select(changedDocument => changedDocument.FilePath));
             }
 
             return $"Successfully renamed '{oldName}' to '{newName}'";
@@ -287,6 +293,29 @@ public static class RenameSymbolTool
             DelegateDeclarationSyntax delegateDeclaration => semanticModel.GetDeclaredSymbol(delegateDeclaration, cancellationToken) as INamedTypeSymbol,
             _ => null
         };
+
+    private static Solution MergeChangedDocumentsIntoSolution(
+        Solution targetSolution,
+        IReadOnlyList<ChangedDocumentWriteback> changedDocuments)
+    {
+        var updatedSolution = targetSolution;
+
+        foreach (var changedDocument in changedDocuments)
+        {
+            var targetDocument = updatedSolution.GetDocument(changedDocument.Document.Id);
+            if (targetDocument == null)
+            {
+                continue;
+            }
+
+            updatedSolution = updatedSolution.WithDocumentText(
+                targetDocument.Id,
+                SourceText.From(changedDocument.UpdatedText, changedDocument.Encoding),
+                PreservationMode.PreserveIdentity);
+        }
+
+        return updatedSolution;
+    }
 
     private sealed record ChangedDocumentWriteback(Document Document, string FilePath, string UpdatedText, Encoding Encoding);
     private sealed record FileRenamePlan(string OldFilePath, string NewFilePath, string UpdatedText);

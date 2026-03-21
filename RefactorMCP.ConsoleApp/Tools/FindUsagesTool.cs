@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.Text;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
 using System.ComponentModel;
+using System.IO;
 
 [McpServerToolType]
 public static class FindUsagesTool
@@ -33,7 +34,8 @@ public static class FindUsagesTool
             }
 
             var solution = await RefactoringHelpers.GetOrLoadSolution(solutionPath, cancellationToken);
-            var document = RefactoringHelpers.GetDocumentByPath(solution, filePath);
+            var symbolSolution = RefactoringHelpers.CreateAnalyzerSafeSolution(solution);
+            var document = RefactoringHelpers.GetDocumentByPath(symbolSolution, filePath);
             if (document == null)
             {
                 throw new McpException($"Error: File {filePath} not found in solution");
@@ -45,11 +47,20 @@ public static class FindUsagesTool
                 throw new McpException($"Error: Symbol '{symbolName}' not found");
             }
 
-            symbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution, cancellationToken) ?? symbol;
+            symbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, symbolSolution, cancellationToken) ?? symbol;
 
-            var referencedSymbols = await SymbolFinder.FindReferencesAsync(symbol, solution, cancellationToken);
-            var declarations = await CollectDeclarationLocationsAsync(referencedSymbols, solution, cancellationToken);
-            var references = await CollectReferenceLocationsAsync(referencedSymbols, cancellationToken);
+            var referencedSymbols = await SymbolFinder.FindReferencesAsync(symbol, symbolSolution, cancellationToken);
+            var sourceTextCache = new Dictionary<string, SourceText>(StringComparer.OrdinalIgnoreCase);
+            var declarations = await CollectDeclarationLocationsAsync(
+                referencedSymbols,
+                symbolSolution,
+                sourceTextCache,
+                cancellationToken);
+            var references = await CollectReferenceLocationsAsync(
+                referencedSymbols,
+                symbolSolution,
+                sourceTextCache,
+                cancellationToken);
 
             var orderedReferences = references
                 .OrderBy(location => RefactoringHelpers.NormalizePathForComparison(location.FilePath))
@@ -81,6 +92,7 @@ public static class FindUsagesTool
     private static async Task<IReadOnlyList<FindUsageLocation>> CollectDeclarationLocationsAsync(
         IEnumerable<ReferencedSymbol> referencedSymbols,
         Solution solution,
+        Dictionary<string, SourceText> sourceTextCache,
         CancellationToken cancellationToken)
     {
         var seenLocations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -90,7 +102,7 @@ public static class FindUsagesTool
         {
             foreach (var location in referencedSymbol.Definition.Locations.Where(location => location.IsInSource))
             {
-                var usage = await TryCreateLocationAsync(location, solution, cancellationToken);
+                var usage = await TryCreateLocationAsync(location, solution, sourceTextCache, cancellationToken);
                 if (usage == null || !seenLocations.Add(CreateLocationKey(usage)))
                 {
                     continue;
@@ -109,6 +121,8 @@ public static class FindUsagesTool
 
     private static async Task<IReadOnlyList<FindUsageLocation>> CollectReferenceLocationsAsync(
         IEnumerable<ReferencedSymbol> referencedSymbols,
+        Solution solution,
+        Dictionary<string, SourceText> sourceTextCache,
         CancellationToken cancellationToken)
     {
         var seenLocations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -118,7 +132,7 @@ public static class FindUsagesTool
         {
             foreach (var location in referencedSymbol.Locations)
             {
-                var usage = await TryCreateLocationAsync(location, cancellationToken);
+                var usage = await TryCreateLocationAsync(location, solution, sourceTextCache, cancellationToken);
                 if (usage == null || !seenLocations.Add(CreateLocationKey(usage)))
                 {
                     continue;
@@ -134,38 +148,25 @@ public static class FindUsagesTool
     private static async Task<FindUsageLocation?> TryCreateLocationAsync(
         Location location,
         Solution solution,
+        Dictionary<string, SourceText> sourceTextCache,
         CancellationToken cancellationToken)
     {
-        var lineSpan = location.GetLineSpan();
-        var filePath = lineSpan.Path;
-        if (string.IsNullOrWhiteSpace(filePath) && location.SourceTree != null)
-        {
-            filePath = location.SourceTree.FilePath;
-        }
-
-        if (string.IsNullOrWhiteSpace(filePath) || !lineSpan.IsValid)
+        if (!TryGetPreferredLineSpan(location, out var filePath, out var lineSpan))
         {
             return null;
         }
 
-        var lineText = string.Empty;
-        if (location.SourceTree != null)
-        {
-            var sourceText = await location.SourceTree.GetTextAsync(cancellationToken);
-            lineText = GetLineText(sourceText, lineSpan.StartLinePosition.Line);
-        }
-        else
-        {
-            var document = solution.Projects
-                .SelectMany(project => project.Documents)
-                .FirstOrDefault(document => RefactoringHelpers.PathEquals(document.FilePath, filePath));
-
-            if (document != null)
-            {
-                var sourceText = await document.GetTextAsync(cancellationToken);
-                lineText = GetLineText(sourceText, lineSpan.StartLinePosition.Line);
-            }
-        }
+        var sourceText = location.SourceTree != null &&
+                         RefactoringHelpers.PathEquals(location.SourceTree.FilePath, filePath)
+            ? await location.SourceTree.GetTextAsync(cancellationToken)
+            : null;
+        var lineText = await GetLineTextAsync(
+            solution,
+            filePath,
+            lineSpan.StartLinePosition.Line,
+            sourceText,
+            sourceTextCache,
+            cancellationToken);
 
         return new FindUsageLocation
         {
@@ -178,28 +179,97 @@ public static class FindUsagesTool
 
     private static async Task<FindUsageLocation?> TryCreateLocationAsync(
         ReferenceLocation location,
+        Solution solution,
+        Dictionary<string, SourceText> sourceTextCache,
         CancellationToken cancellationToken)
     {
-        var filePath = location.Document.FilePath;
-        if (string.IsNullOrWhiteSpace(filePath))
+        if (!TryGetPreferredLineSpan(location.Location, out var filePath, out var lineSpan))
         {
             return null;
         }
 
-        var lineSpan = location.Location.GetLineSpan();
-        if (!lineSpan.IsValid)
-        {
-            return null;
-        }
+        var sourceText = !string.IsNullOrWhiteSpace(location.Document.FilePath) &&
+                         RefactoringHelpers.PathEquals(location.Document.FilePath, filePath)
+            ? await location.Document.GetTextAsync(cancellationToken)
+            : null;
+        var lineText = await GetLineTextAsync(
+            solution,
+            filePath,
+            lineSpan.StartLinePosition.Line,
+            sourceText,
+            sourceTextCache,
+            cancellationToken);
 
-        var sourceText = await location.Document.GetTextAsync(cancellationToken);
         return new FindUsageLocation
         {
             FilePath = filePath,
             Line = lineSpan.StartLinePosition.Line + 1,
             Column = lineSpan.StartLinePosition.Character + 1,
-            LineText = GetLineText(sourceText, lineSpan.StartLinePosition.Line)
+            LineText = lineText
         };
+    }
+
+    private static bool TryGetPreferredLineSpan(
+        Location location,
+        out string filePath,
+        out FileLinePositionSpan lineSpan)
+    {
+        var mappedLineSpan = location.GetMappedLineSpan();
+        if (mappedLineSpan.IsValid &&
+            mappedLineSpan.HasMappedPath &&
+            !string.IsNullOrWhiteSpace(mappedLineSpan.Path))
+        {
+            filePath = mappedLineSpan.Path;
+            lineSpan = mappedLineSpan;
+            return true;
+        }
+
+        lineSpan = location.GetLineSpan();
+        filePath = lineSpan.Path;
+        if (string.IsNullOrWhiteSpace(filePath) && location.SourceTree != null)
+        {
+            filePath = location.SourceTree.FilePath;
+        }
+
+        return lineSpan.IsValid && !string.IsNullOrWhiteSpace(filePath);
+    }
+
+    private static async Task<string> GetLineTextAsync(
+        Solution solution,
+        string filePath,
+        int lineIndex,
+        SourceText? sourceText,
+        Dictionary<string, SourceText> sourceTextCache,
+        CancellationToken cancellationToken)
+    {
+        if (sourceText != null)
+        {
+            return GetLineText(sourceText, lineIndex);
+        }
+
+        var normalizedFilePath = RefactoringHelpers.NormalizePathForComparison(filePath);
+        if (sourceTextCache.TryGetValue(normalizedFilePath, out var cachedSourceText))
+        {
+            return GetLineText(cachedSourceText, lineIndex);
+        }
+
+        var document = RefactoringHelpers.GetDocumentByPath(solution, filePath);
+        if (document != null)
+        {
+            var documentText = await document.GetTextAsync(cancellationToken);
+            sourceTextCache[normalizedFilePath] = documentText;
+            return GetLineText(documentText, lineIndex);
+        }
+
+        if (!File.Exists(filePath))
+        {
+            return string.Empty;
+        }
+
+        var (fileContent, _) = await RefactoringHelpers.ReadFileWithEncodingAsync(filePath, cancellationToken);
+        var fileText = SourceText.From(fileContent);
+        sourceTextCache[normalizedFilePath] = fileText;
+        return GetLineText(fileText, lineIndex);
     }
 
     private static string CreateLocationKey(FindUsageLocation location)

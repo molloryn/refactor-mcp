@@ -1,6 +1,7 @@
 using ModelContextProtocol.Server;
 using ModelContextProtocol;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.Build.Locator;
 using Microsoft.Extensions.Caching.Memory;
@@ -272,20 +273,67 @@ internal static class RefactoringHelpers
         return solution;
     }
 
+    internal static Solution CreateAnalyzerSafeSolution(Solution solution)
+    {
+        var sanitizedSolution = solution;
+
+        foreach (var projectId in sanitizedSolution.ProjectIds)
+        {
+            var project = sanitizedSolution.GetProject(projectId);
+            if (project == null)
+            {
+                continue;
+            }
+
+            var analyzerReferences = project.AnalyzerReferences.ToArray();
+            if (!analyzerReferences.Any(reference => reference is UnresolvedAnalyzerReference))
+            {
+                continue;
+            }
+
+            sanitizedSolution = sanitizedSolution.WithProjectAnalyzerReferences(
+                projectId,
+                analyzerReferences.Where(reference => reference is not UnresolvedAnalyzerReference));
+        }
+
+        return sanitizedSolution;
+    }
+
     // Solutions are immutable, so replacing the cached instance is safe even
     // when accessed concurrently by multiple threads.
+    internal static void UpdateSolutionCache(
+        Solution updatedSolution,
+        IEnumerable<string>? changedFilePaths = null)
+    {
+        var solutionPath = updatedSolution.FilePath;
+        if (string.IsNullOrEmpty(solutionPath))
+        {
+            return;
+        }
+
+        SetLoadedSolution(solutionPath!, updatedSolution);
+        RazorSolutionContextCache.Remove(solutionPath!);
+
+        if (changedFilePaths == null)
+        {
+            return;
+        }
+
+        foreach (var filePath in changedFilePaths
+                     .Where(path => !string.IsNullOrWhiteSpace(path))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            _ = MetricsProvider.RefreshFileMetrics(solutionPath!, filePath);
+        }
+    }
+
     internal static void UpdateSolutionCache(Document updatedDocument)
     {
-        var solutionPath = updatedDocument.Project.Solution.FilePath;
-        if (!string.IsNullOrEmpty(solutionPath))
-        {
-            SetLoadedSolution(solutionPath!, updatedDocument.Project.Solution);
-            RazorSolutionContextCache.Remove(solutionPath!);
-            if (!string.IsNullOrEmpty(updatedDocument.FilePath))
-            {
-                _ = MetricsProvider.RefreshFileMetrics(solutionPath!, updatedDocument.FilePath!);
-            }
-        }
+        UpdateSolutionCache(
+            updatedDocument.Project.Solution,
+            string.IsNullOrWhiteSpace(updatedDocument.FilePath)
+                ? null
+                : [updatedDocument.FilePath!]);
     }
 
     internal static async Task<RazorSolutionContext> GetOrLoadRazorSolutionContext(
