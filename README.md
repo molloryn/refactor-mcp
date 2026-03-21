@@ -32,6 +32,28 @@ docker run --rm -i \
   refactor-mcp:local
 ```
 
+If you build the same repository on Windows and then point the Linux container at that working tree, stale files under `obj/` can carry Windows-only package paths into container restores or builds. Typical failures include missing fallback package folders from `ResolvePackageAssets` or duplicate generated assembly attributes after switching environments.
+
+For Windows-side development, isolate intermediate and output folders by environment in your own `Directory.Build.props`:
+
+```xml
+<Project>
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin/**;obj/**</DefaultItemExcludes>
+
+    <BuildEnvironmentFolder>unix</BuildEnvironmentFolder>
+    <BuildEnvironmentFolder Condition="'$(OS)' == 'Windows_NT'">win</BuildEnvironmentFolder>
+    <BuildEnvironmentFolder Condition="'$(DOTNET_RUNNING_IN_CONTAINER)' == 'true'">container</BuildEnvironmentFolder>
+
+    <BaseIntermediateOutputPath>obj/$(BuildEnvironmentFolder)/</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    <BaseOutputPath>bin/$(BuildEnvironmentFolder)/</BaseOutputPath>
+  </PropertyGroup>
+</Project>
+```
+
+This keeps the familiar `obj/` and `bin/` roots while separating Windows, container, and other Unix-generated assets. If you do mount a host `NuGet.Config`, make sure it does not reference Windows-only fallback package folders unless those paths also exist in the container.
+
 Run a simple JSON-mode smoke test inside the container:
 
 ```bash
