@@ -11,9 +11,11 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System.Linq;
 using Microsoft.CodeAnalysis.Text;
 using System.Text;
+using Microsoft.CodeAnalysis.Host;
 using Microsoft.CodeAnalysis.Host.Mef;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 
 
 
@@ -21,6 +23,12 @@ internal static class RefactoringHelpers
 {
     internal const string SolutionPathDescription = "Absolute path to the solution file (.sln or .slnx)";
     private static readonly string[] SupportedSolutionExtensions = [".slnx", ".sln"];
+    private static readonly Lazy<HostServices> _msbuildHost =
+        new(() => MefHostServices.Create(MSBuildMefHostServices.DefaultAssemblies));
+    private static readonly ConcurrentDictionary<string, LoadedSolutionSession> _loadedSolutions =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _solutionLoadLocks =
+        new(StringComparer.OrdinalIgnoreCase);
 
     // MemoryCache is thread-safe and Solution objects from Roslyn are immutable.
     // This allows us to store and access Solution instances across threads
@@ -32,14 +40,16 @@ internal static class RefactoringHelpers
 
     internal static void ClearAllCaches()
     {
-        SolutionCache.Dispose();
-        SolutionCache = new MemoryCache(new MemoryCacheOptions());
-        SyntaxTreeCache.Dispose();
-        SyntaxTreeCache = new MemoryCache(new MemoryCacheOptions());
-        ModelCache.Dispose();
-        ModelCache = new MemoryCache(new MemoryCacheOptions());
-        RazorSolutionContextCache.Dispose();
-        RazorSolutionContextCache = new MemoryCache(new MemoryCacheOptions());
+        foreach (var session in _loadedSolutions.Values.ToArray())
+        {
+            session.Dispose();
+        }
+
+        _loadedSolutions.Clear();
+        SolutionCache.Compact(1.0);
+        SyntaxTreeCache.Compact(1.0);
+        ModelCache.Compact(1.0);
+        RazorSolutionContextCache.Compact(1.0);
     }
 
     private static readonly Lazy<AdhocWorkspace> _workspace =
@@ -64,11 +74,83 @@ internal static class RefactoringHelpers
     internal static MSBuildWorkspace CreateWorkspace()
     {
         EnsureMsBuildRegistered();
-        var host = MefHostServices.Create(MSBuildMefHostServices.DefaultAssemblies);
-        var workspace = MSBuildWorkspace.Create(host);
+        var workspace = MSBuildWorkspace.Create(_msbuildHost.Value);
         workspace.WorkspaceFailed += (_, e) =>
             Console.Error.WriteLine(e.Diagnostic.Message);
         return workspace;
+    }
+
+    internal static bool TryGetLoadedSolution(string solutionPath, out Solution? solution)
+    {
+        solution = null;
+        if (!_loadedSolutions.TryGetValue(solutionPath, out var session))
+        {
+            return false;
+        }
+
+        solution = session.Solution;
+        return true;
+    }
+
+    internal static bool TryGetReusableLoadedSolution(string solutionPath, out Solution? solution)
+    {
+        solution = null;
+        if (!_loadedSolutions.TryGetValue(solutionPath, out var session) || session.IsDirty)
+        {
+            return false;
+        }
+
+        solution = session.Solution;
+        return true;
+    }
+
+    internal static bool TryUnloadSolution(string solutionPath)
+    {
+        var removed = _loadedSolutions.TryRemove(solutionPath, out var session);
+        if (!removed)
+        {
+            return false;
+        }
+
+        session!.Dispose();
+        SolutionCache.Remove(solutionPath);
+        RazorSolutionContextCache.Remove(solutionPath);
+        return true;
+    }
+
+    internal static async Task<Solution> LoadSolutionIntoSession(
+        string solutionPath,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        solutionPath = ResolveSolutionPath(solutionPath);
+        var loadLock = _solutionLoadLocks.GetOrAdd(solutionPath, _ => new SemaphoreSlim(1, 1));
+        await loadLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (TryGetLoadedSolution(solutionPath, out var cachedSolution))
+            {
+                return cachedSolution!;
+            }
+
+            var workspace = CreateWorkspace();
+            try
+            {
+                progress?.Report($"Opening solution '{Path.GetFileName(solutionPath)}'");
+                var solution = await workspace.OpenSolutionAsync(solutionPath, progress: null, cancellationToken);
+                CacheLoadedSolution(solutionPath, workspace, solution);
+                return solution;
+            }
+            catch
+            {
+                workspace.Dispose();
+                throw;
+            }
+        }
+        finally
+        {
+            loadLock.Release();
+        }
     }
 
     internal static bool TryResolveSolutionPath(string solutionPath, out string resolvedSolutionPath)
@@ -146,14 +228,12 @@ internal static class RefactoringHelpers
     {
         solutionPath = ResolveSolutionPath(solutionPath);
 
-        if (SolutionCache.TryGetValue(solutionPath, out Solution? cachedSolution))
+        if (TryGetLoadedSolution(solutionPath, out var cachedSolution))
         {
             Directory.SetCurrentDirectory(Path.GetDirectoryName(solutionPath)!);
             return cachedSolution!;
         }
-        using var workspace = CreateWorkspace();
-        var solution = await workspace.OpenSolutionAsync(solutionPath, progress: null, cancellationToken);
-        SolutionCache.Set(solutionPath, solution);
+        var solution = await LoadSolutionIntoSession(solutionPath, progress: null, cancellationToken);
         Directory.SetCurrentDirectory(Path.GetDirectoryName(solutionPath)!);
         return solution;
     }
@@ -165,7 +245,7 @@ internal static class RefactoringHelpers
         var solutionPath = updatedDocument.Project.Solution.FilePath;
         if (!string.IsNullOrEmpty(solutionPath))
         {
-            SolutionCache.Set(solutionPath!, updatedDocument.Project.Solution);
+            SetLoadedSolution(solutionPath!, updatedDocument.Project.Solution);
             RazorSolutionContextCache.Remove(solutionPath!);
             if (!string.IsNullOrEmpty(updatedDocument.FilePath))
             {
@@ -191,8 +271,7 @@ internal static class RefactoringHelpers
     internal static void InvalidateSolutionCaches(string solutionPath)
     {
         solutionPath = ResolveSolutionPath(solutionPath);
-        SolutionCache.Remove(solutionPath);
-        RazorSolutionContextCache.Remove(solutionPath);
+        TryUnloadSolution(solutionPath);
     }
 
     internal static Document? GetDocumentByPath(Solution solution, string filePath)
@@ -381,7 +460,7 @@ internal static class RefactoringHelpers
         var solutionPath = project.Solution.FilePath;
         if (!string.IsNullOrEmpty(solutionPath))
         {
-            SolutionCache.Set(solutionPath!, newDoc.Project.Solution);
+            SetLoadedSolution(solutionPath!, newDoc.Project.Solution);
         }
     }
 
@@ -532,5 +611,39 @@ internal static class RefactoringHelpers
             return await withSolution(document);
 
         return await singleFile(filePath);
+    }
+
+    private static void CacheLoadedSolution(
+        string solutionPath,
+        MSBuildWorkspace workspace,
+        Solution solution)
+    {
+        _loadedSolutions[solutionPath] = new LoadedSolutionSession(workspace, solution);
+        SolutionCache.Set(solutionPath, solution);
+    }
+
+    private static void SetLoadedSolution(string solutionPath, Solution solution)
+    {
+        if (_loadedSolutions.TryGetValue(solutionPath, out var session))
+        {
+            session.UpdateSolution(solution);
+            session.MarkDirty();
+        }
+
+        SolutionCache.Set(solutionPath, solution);
+    }
+
+    private sealed class LoadedSolutionSession(MSBuildWorkspace workspace, Solution solution) : IDisposable
+    {
+        private Solution _solution = solution;
+        private int _isDirty;
+
+        internal Solution Solution => Volatile.Read(ref _solution);
+        internal bool IsDirty => Volatile.Read(ref _isDirty) != 0;
+
+        internal void UpdateSolution(Solution solution) => Volatile.Write(ref _solution, solution);
+        internal void MarkDirty() => Volatile.Write(ref _isDirty, 1);
+
+        public void Dispose() => workspace.Dispose();
     }
 }

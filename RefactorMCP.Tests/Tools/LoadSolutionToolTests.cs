@@ -1,6 +1,7 @@
 using System.Threading;
 using System.Threading.Tasks;
 using System.IO;
+using System.Linq;
 using ModelContextProtocol;
 using Xunit;
 
@@ -23,6 +24,53 @@ public class LoadSolutionToolTests : RefactorMCP.Tests.TestBase
         await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
         var result = UnloadSolutionTool.UnloadSolution(SolutionPath);
         Assert.Contains("Unloaded solution", result);
+    }
+
+    [Fact]
+    public async Task LoadSolution_AlreadyLoadedAndUnchanged_ReusesWorkspace()
+    {
+        UnloadSolutionTool.ClearSolutionCache();
+        await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var firstSolution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+
+        var result = await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var secondSolution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+
+        Assert.Contains("Successfully loaded solution", result);
+        Assert.Same(firstSolution.Workspace, secondSolution.Workspace);
+    }
+
+    [Fact]
+    public async Task LoadSolution_WhenCachedSolutionWasUpdated_ReloadsWorkspace()
+    {
+        UnloadSolutionTool.ClearSolutionCache();
+        await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var firstSolution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+        var firstDocument = firstSolution.Projects
+            .SelectMany(project => project.Documents)
+            .First(document => document.FilePath != null);
+
+        RefactoringHelpers.UpdateSolutionCache(firstDocument);
+
+        await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var secondSolution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+
+        Assert.NotSame(firstSolution.Workspace, secondSolution.Workspace);
+    }
+
+    [Fact]
+    public async Task UnloadSolution_AfterReload_CreatesNewWorkspace()
+    {
+        UnloadSolutionTool.ClearSolutionCache();
+        await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var firstSolution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+
+        UnloadSolutionTool.UnloadSolution(SolutionPath);
+
+        await LoadSolutionTool.LoadSolution(SolutionPath, null, CancellationToken.None);
+        var secondSolution = await RefactoringHelpers.GetOrLoadSolution(SolutionPath);
+
+        Assert.NotSame(firstSolution.Workspace, secondSolution.Workspace);
     }
 
     [Fact]

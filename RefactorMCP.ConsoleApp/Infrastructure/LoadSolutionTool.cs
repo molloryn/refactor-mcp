@@ -1,13 +1,12 @@
 using ModelContextProtocol.Server;
 using ModelContextProtocol;
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.MSBuild;
-using Microsoft.Extensions.Caching.Memory;
 using RefactorMCP.ConsoleApp.Tools;
 using System.ComponentModel;
 using System.IO;
 using System.Collections.Generic;
 using System.Threading;
+using System.Diagnostics;
 
 
 [McpServerToolType]
@@ -23,9 +22,6 @@ public static class LoadSolutionTool
         {
             solutionPath = RefactoringHelpers.ResolveSolutionPath(solutionPath);
 
-            RefactoringHelpers.ClearAllCaches();
-            MoveMethodTool.ResetMoveHistory();
-
             var logDir = Path.Combine(Path.GetDirectoryName(solutionPath)!, ".refactor-mcp");
             ToolCallLogger.SetLogDirectory(logDir);
             ToolCallLogger.Log(nameof(LoadSolution), new Dictionary<string, string?> { ["solutionPath"] = solutionPath });
@@ -33,28 +29,33 @@ public static class LoadSolutionTool
             Directory.SetCurrentDirectory(Path.GetDirectoryName(solutionPath)!);
             progress?.Report($"Loading {solutionPath}");
 
-            if (RefactoringHelpers.SolutionCache.TryGetValue(solutionPath, out Solution? cached))
+            if (RefactoringHelpers.TryGetReusableLoadedSolution(solutionPath, out var cached))
             {
-                var cachedProjects = cached!.Projects.Select(p => p.Name).ToList();
-                return $"Successfully loaded solution '{Path.GetFileName(solutionPath)}' with {cachedProjects.Count} projects: {string.Join(", ", cachedProjects)}";
+                return BuildLoadedMessage(solutionPath, cached!);
             }
 
-            using var workspace = RefactoringHelpers.CreateWorkspace();
-            var solution = await workspace.OpenSolutionAsync(solutionPath, progress: null, cancellationToken);
+            RefactoringHelpers.ClearAllCaches();
+            MoveMethodTool.ResetMoveHistory();
 
-            RefactoringHelpers.SolutionCache.Set(solutionPath, solution);
-
+            var stopwatch = Stopwatch.StartNew();
+            var solution = await RefactoringHelpers.LoadSolutionIntoSession(solutionPath, progress, cancellationToken);
+            stopwatch.Stop();
             var metricsDir = Path.Combine(Path.GetDirectoryName(solutionPath)!, ".refactor-mcp", "metrics");
             Directory.CreateDirectory(metricsDir);
 
-            var projects = solution.Projects.Select(p => p.Name).ToList();
-            var message = $"Successfully loaded solution '{Path.GetFileName(solutionPath)}' with {projects.Count} projects: {string.Join(", ", projects)}";
-            progress?.Report(message);
+            var message = BuildLoadedMessage(solutionPath, solution);
+            progress?.Report($"{message} in {stopwatch.Elapsed:mm\\:ss\\.fff}");
             return message;
         }
         catch (Exception ex)
         {
             throw new McpException($"Error loading solution: {ex.Message}", ex);
         }
+    }
+
+    private static string BuildLoadedMessage(string solutionPath, Solution solution)
+    {
+        var projects = solution.Projects.Select(p => p.Name).ToList();
+        return $"Successfully loaded solution '{Path.GetFileName(solutionPath)}' with {projects.Count} projects: {string.Join(", ", projects)}";
     }
 }

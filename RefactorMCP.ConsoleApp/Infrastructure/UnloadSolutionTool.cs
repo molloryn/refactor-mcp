@@ -1,5 +1,4 @@
 using ModelContextProtocol.Server;
-using Microsoft.Extensions.Caching.Memory;
 using System.ComponentModel;
 using System.IO;
 using System.Threading;
@@ -16,9 +15,8 @@ public static class UnloadSolutionTool
             ? resolvedPath
             : Path.GetFullPath(solutionPath);
 
-        if (RefactoringHelpers.SolutionCache.TryGetValue(resolvedSolutionPath, out _))
+        if (RefactoringHelpers.TryUnloadSolution(resolvedSolutionPath))
         {
-            RefactoringHelpers.SolutionCache.Remove(resolvedSolutionPath);
             return $"Unloaded solution '{Path.GetFileName(resolvedSolutionPath)}' from cache";
         }
 
